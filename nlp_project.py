@@ -271,12 +271,3 @@ chars['map_from'] = {c:i for i, c in enumerate(chars['unique'])}
 chars['map_to'] = np.array(chars['unique'])
 chars['as_int'] = np.array([chars['map_from'][c] for c in corpus_char_list])
 
-pprint(words)
-
-model = create_text_generator()
-
-generate_text(model, "Moon")
-
-# GAN Loss
-# Preprocessing using NLTK/Spacy
-# LSTM model
