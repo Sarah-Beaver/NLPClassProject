@@ -1,4 +1,4 @@
-import nlp_project
+from nlp_project import *
 
 model = create_text_generator()
 
