@@ -197,7 +197,7 @@ def create_text_generator(sequence_length=10, num_training_epochs=5, mname=None)
 
   model = init_model(batch_size=1)
 
-  model.load_weights(tf.train.latest_checkpoint(checkpoint_model_dir))
+  model.load_weights(tf.train.latest_checkpoint(checkpoint_model_dir)).expect_partial()
 
   model.build(tf.TensorShape([1, None]))
 
