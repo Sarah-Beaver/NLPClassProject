@@ -1,6 +1,6 @@
 import tensorflow as tf
 from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import Dense, Embedding, GRU
+from tensorflow.keras.layers import Dense, Embedding, GRU, LSTM
 
 import pandas as pd
 import numpy as np
@@ -94,6 +94,18 @@ def init_model(embedding_dim=256, rnn_units=1024, batch_size=64):
   layers = [
       Embedding(words['nunique'], embedding_dim, batch_input_shape=[batch_size, None]),
       GRU(rnn_units, 
+          return_sequences=True,
+          stateful=True,
+          recurrent_initializer='glorot_uniform'),
+      Dense(words['nunique'])
+  ]
+
+  return Sequential(layers)
+
+def init_LSTMmodel(embedding_dim=256, rnn_units=1024, batch_size=64):
+  layers = [
+      Embedding(words['nunique'], embedding_dim, batch_input_shape=[batch_size, None]),
+      LSTM(rnn_units, 
           return_sequences=True,
           stateful=True,
           recurrent_initializer='glorot_uniform'),
@@ -206,6 +218,36 @@ def create_text_generator(sequence_length=10, num_training_epochs=5, mname=None)
   shutil.rmtree(checkpoint_dir)
 
   return model
+
+def create_text_generatorLSTM(sequence_length=10, num_training_epochs=5, mname=None):
+  model = init_LSTMmodel()
+
+  model.compile(optimizer='adam', loss=loss)
+
+  if mname is None:
+    mname = model_name(sequence_length, num_training_epochs)
+
+  checkpoint_dir = models_dir / 'LSTM_training_checkpoints'
+  checkpoint_model_dir = checkpoint_dir / mname
+  checkpoint_prefix = checkpoint_model_dir / "ckpt_{epoch}"
+  checkpoint_callback=tf.keras.callbacks.ModelCheckpoint(
+      filepath=checkpoint_prefix,
+      save_weights_only=True)
+
+  model.fit(prep_training_dataset(sequence_length=sequence_length), epochs=num_training_epochs, callbacks=[checkpoint_callback])
+
+  model = init_LSTMmodel(batch_size=1)
+
+  model.load_weights(tf.train.latest_checkpoint(checkpoint_model_dir)).expect_partial()
+
+  model.build(tf.TensorShape([1, None]))
+
+  model_names[model] = mname
+
+  shutil.rmtree(checkpoint_dir)
+
+  return model
+
 
 def list_models():
   if models_dir.is_dir():
