@@ -114,6 +114,22 @@ def init_LSTMmodel(embedding_dim=256, rnn_units=1024, batch_size=64):
 
   return Sequential(layers)
 
+def init_LSTMmodel_2Layer(embedding_dim=256, rnn_units=1024, batch_size=64):
+  layers = [
+      Embedding(words['nunique'], embedding_dim, batch_input_shape=[batch_size, None]),
+      LSTM(rnn_units, 
+          return_sequences=True,
+          stateful=True,
+          recurrent_initializer='glorot_uniform'),
+        LSTM(rnn_units, 
+          return_sequences=True,
+          stateful=True,
+          recurrent_initializer='glorot_uniform'),
+      Dense(words['nunique'])
+  ]
+
+  return Sequential(layers)
+
 # for creating training examples
 def split_input_target(chunk):
   input_text = chunk[:-1]
@@ -219,8 +235,12 @@ def create_text_generator(sequence_length=10, num_training_epochs=5, mname=None)
 
   return model
 
-def create_text_generatorLSTM(sequence_length=10, num_training_epochs=5, mname=None):
-  model = init_LSTMmodel()
+def create_text_generatorLSTM(sequence_length=10, num_training_epochs=5, mname=None, embedding_dim=256, rnn_units=1024, batch_size=64, num_layers=1):
+  if num_layers ==1:
+    model = init_LSTMmodel(embedding_dim=embedding_dim, rnn_units=rnn_units, batch_size=batch_size)
+  elif num_layers ==2:
+    model = init_LSTMmodel_2Layer(embedding_dim=embedding_dim, rnn_units=rnn_units, batch_size=batch_size)
+
 
   model.compile(optimizer='adam', loss=loss)
 
@@ -236,7 +256,10 @@ def create_text_generatorLSTM(sequence_length=10, num_training_epochs=5, mname=N
 
   model.fit(prep_training_dataset(sequence_length=sequence_length), epochs=num_training_epochs, callbacks=[checkpoint_callback])
 
-  model = init_LSTMmodel(batch_size=1)
+  if num_layers ==1:
+    model = init_LSTMmodel(batch_size=1)
+  elif num_layers ==2:
+    model = init_LSTMmodel_2Layer(batch_size=1)
 
   model.load_weights(tf.train.latest_checkpoint(checkpoint_model_dir)).expect_partial()
 
