@@ -1,17 +1,40 @@
+# !pip install keras-tuner
+import warnings  # stop annoying tf info dumping
+warnings.filterwarnings('ignore')
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
+import pickle
+import keras_tuner as kt
+
 import tensorflow as tf
 from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import Dense, Embedding, GRU, LSTM
+from tensorflow.keras.layers import Dense, Embedding, GRU, LSTM, Attention
 
 import pandas as pd
 import numpy as np
 
 import unicodedata
 
+from gc import collect
 from pathlib import Path
 import re
 import shutil
 from datetime import datetime
 from pprint import pprint
+from sklearn.model_selection import train_test_split
+from collections import defaultdict
+from collections import Counter
+from numpy.random import choice 
+from random import shuffle
+import math
+import nltk
+from nltk import word_tokenize, sent_tokenize
+nltk.download('punkt')
+try:
+  #tf.config.experimental.set_memory_growth(tf.config.list_physical_devices('GPU')[0], True)
+  tf.keras.mixed_precision.set_global_policy('mixed_float16')
+except:
+  pass
 
 
 models_dir = Path('.') / 'models'
@@ -90,45 +113,9 @@ def create_corpus():
 
   return words_in_corpus, chars_in_corpus, corpus, df
 
-def init_model(embedding_dim=256, rnn_units=1024, batch_size=64):
-  layers = [
-      Embedding(words['nunique'], embedding_dim, batch_input_shape=[batch_size, None]),
-      GRU(rnn_units, 
-          return_sequences=True,
-          stateful=True,
-          recurrent_initializer='glorot_uniform'),
-      Dense(words['nunique'])
-  ]
 
-  return Sequential(layers)
 
-def init_LSTMmodel(embedding_dim=256, rnn_units=1024, batch_size=64):
-  layers = [
-      Embedding(words['nunique'], embedding_dim, batch_input_shape=[batch_size, None]),
-      LSTM(rnn_units, 
-          return_sequences=True,
-          stateful=True,
-          recurrent_initializer='glorot_uniform'),
-      Dense(words['nunique'])
-  ]
 
-  return Sequential(layers)
-
-def init_LSTMmodel_2Layer(embedding_dim=256, rnn_units=1024, batch_size=64):
-  layers = [
-      Embedding(words['nunique'], embedding_dim, batch_input_shape=[batch_size, None]),
-      LSTM(rnn_units, 
-          return_sequences=True,
-          stateful=True,
-          recurrent_initializer='glorot_uniform'),
-        LSTM(rnn_units, 
-          return_sequences=True,
-          stateful=True,
-          recurrent_initializer='glorot_uniform'),
-      Dense(words['nunique'])
-  ]
-
-  return Sequential(layers)
 
 # for creating training examples
 def split_input_target(chunk):
@@ -206,10 +193,32 @@ def generate_text(model, start_string, num_generate=50):
       ret += ' ' + w
   return ret
 
-def create_text_generator(sequence_length=10, num_training_epochs=5, mname=None):
-  model = init_model()
+def init_model(embedding_dim=256, num_layers=2,sequence_length=10, rnn_units=1024, bs=64,normalize=0,
+                   dropout_rate=.2, regularize_rate=.01):
+  inputs = tf.keras.Input(batch_input_shape=[bs, None])
+  x = Embedding(words['nunique'], embedding_dim, input_length=sequence_length,batch_input_shape=[bs, None])(inputs)
+  if normalize == 1:
+    x = tf.keras.layers.Normalization()(x)
+  for i in range(num_layers): 
+    x = GRU(rnn_units, return_sequences=True,stateful=True,recurrent_initializer='glorot_uniform')(x)
+    if dropout_rate > 0.0:
+      x = tf.keras.layers.Dropout(dropout_rate)(x)
+  if regularize_rate >0.0:
+    x = Dense(words['nunique'], activation='softmax', activity_regularizer=tf.keras.regularizers.L2(regularize_rate)) (x)
+  else:
+    x = Dense(words['nunique'], activation='softmax')(x)
+  model = tf.keras.Model(inputs,x)
+  return model
 
-  model.compile(optimizer='adam', loss=loss)
+def create_text_generator(sequence_length=10, num_training_epochs=5, mname=None, embedding_dim=256, rnn_units=1024, batch_size=64, num_layers=1, lr=.001, epsilon=1e-08,
+                              normalize=0,dropout_rate=.2, regularize_rate=0):
+  
+  model = init_model(embedding_dim=embedding_dim, sequence_length=sequence_length, num_layers=num_layers, rnn_units=rnn_units, bs=batch_size,
+                         normalize=normalize, dropout_rate=dropout_rate,  regularize_rate=regularize_rate)
+
+  optimizer = tf.keras.optimizers.Adamax(learning_rate=lr,epsilon=epsilon,name='Adamax')
+  model.compile(optimizer=optimizer, loss='sparse_categorical_crossentropy')
+
 
   if mname is None:
     mname = model_name(sequence_length, num_training_epochs)
@@ -223,7 +232,8 @@ def create_text_generator(sequence_length=10, num_training_epochs=5, mname=None)
 
   model.fit(prep_training_dataset(sequence_length=sequence_length), epochs=num_training_epochs, callbacks=[checkpoint_callback])
 
-  model = init_model(batch_size=1)
+  model = init_model(embedding_dim=embedding_dim, sequence_length=sequence_length, num_layers=num_layers, rnn_units=rnn_units, bs=1, 
+                         normalize=normalize, dropout_rate=dropout_rate,  regularize_rate=regularize_rate)
 
   model.load_weights(tf.train.latest_checkpoint(checkpoint_model_dir)).expect_partial()
 
@@ -235,14 +245,31 @@ def create_text_generator(sequence_length=10, num_training_epochs=5, mname=None)
 
   return model
 
-def create_text_generatorLSTM(sequence_length=10, num_training_epochs=5, mname=None, embedding_dim=256, rnn_units=1024, batch_size=64, num_layers=1):
-  if num_layers ==1:
-    model = init_LSTMmodel(embedding_dim=embedding_dim, rnn_units=rnn_units, batch_size=batch_size)
-  elif num_layers ==2:
-    model = init_LSTMmodel_2Layer(embedding_dim=embedding_dim, rnn_units=rnn_units, batch_size=batch_size)
+def init_LSTMmodel(embedding_dim=256, num_layers=2,sequence_length=10, rnn_units=1024, bs=64,normalize=0,
+                   dropout_rate=.2, regularize_rate=.01):
+    inputs = tf.keras.Input(batch_input_shape=[bs, None])
+    x = Embedding(words['nunique'], embedding_dim, input_length=sequence_length,batch_input_shape=[bs, None])(inputs)
+    if normalize == 1:
+      x = tf.keras.layers.Normalization()(x)
+    for i in range(num_layers): 
+      x = LSTM(int(rnn_units/num_layers), return_sequences=True, stateful=True, recurrent_initializer='glorot_uniform')(x)
+      if dropout_rate > 0.0:
+        x = tf.keras.layers.Dropout(dropout_rate)(x)
+    if regularize_rate >0.0:
+      x = Dense(words['nunique'], activation='softmax', activity_regularizer=tf.keras.regularizers.L2(regularize_rate)) (x)
+    else:
+      x = Dense(words['nunique'], activation='softmax')(x)
+    model = tf.keras.Model(inputs,x)
+    return model
 
+def create_text_generatorLSTM(sequence_length=10, num_training_epochs=5, mname=None, embedding_dim=256, rnn_units=1024, batch_size=64, num_layers=1, lr=.001, epsilon=1e-08,
+                              normalize=0,dropout_rate=.2, regularize_rate=0):
 
-  model.compile(optimizer='adam', loss=loss)
+  model = init_LSTMmodel(embedding_dim=embedding_dim, sequence_length=sequence_length, num_layers=num_layers, rnn_units=rnn_units, bs=batch_size,
+                         normalize=normalize, dropout_rate=dropout_rate,  regularize_rate=regularize_rate)
+
+  optimizer = tf.keras.optimizers.Adamax(learning_rate=lr,epsilon=epsilon,name='Adamax')
+  model.compile(optimizer=optimizer, loss='sparse_categorical_crossentropy')
 
   if mname is None:
     mname = model_name(sequence_length, num_training_epochs)
@@ -256,10 +283,8 @@ def create_text_generatorLSTM(sequence_length=10, num_training_epochs=5, mname=N
 
   model.fit(prep_training_dataset(sequence_length=sequence_length), epochs=num_training_epochs, callbacks=[checkpoint_callback])
 
-  if num_layers ==1:
-    model = init_LSTMmodel(batch_size=1)
-  elif num_layers ==2:
-    model = init_LSTMmodel_2Layer(batch_size=1)
+  model = init_LSTMmodel(embedding_dim=embedding_dim, sequence_length=sequence_length, num_layers=num_layers, rnn_units=rnn_units, bs=1, 
+                         normalize=normalize, dropout_rate=dropout_rate,  regularize_rate=regularize_rate)
 
   model.load_weights(tf.train.latest_checkpoint(checkpoint_model_dir)).expect_partial()
 
@@ -271,6 +296,438 @@ def create_text_generatorLSTM(sequence_length=10, num_training_epochs=5, mname=N
 
   return model
 
+##########################################################################################
+# John's experiments to alleviate the terrible sentences we have produced for ourselves
+##########################################################################################
+class tuned_models:
+  def __init__(self, words, chars, corpus):
+      self.words = words
+      self.chars = chars
+      self.tuned_LSTM = None
+      self.tuned_GRU = None
+      self.auto_encoder = None
+      self.transfer_learning = None
+      self.training, self.validation = None, None
+      self.trigram = None
+      self.corpus = corpus
+      self.attention_model = None
+      self.tuner = None
+  def pickle_save(self):
+        return self.tuner
+  def dataset(self, sequence_length=10, batch_size=64, split_testing = 0.1, buffer_size=10000, seed = 3):
+      dataset, validation = train_test_split(words['as_int'], test_size=split_testing, random_state=seed)
+      def split(input):
+          word_dataset = tf.data.Dataset.from_tensor_slices(words['as_int'])
+          sequences = word_dataset.batch(sequence_length+1, drop_remainder=True)
+          dataset_unshuffled = sequences.map(split_input_target)
+          return dataset_unshuffled.shuffle(buffer_size).batch(batch_size, drop_remainder=True)
+      self.training, self.validation = split(dataset), split(validation)
+
+  def generate_text(self, model, start_string = "Antifa calls for", num_generate=50, temperature = 1.0, num_samples=1, print_text=False):
+      input_eval = [self.words['map_from'][w] for w in process_new_text(start_string)]
+      input_eval = tf.expand_dims(input_eval, 0)
+      text_generated = []
+      model.reset_states()
+      for i in range(num_generate):
+        predictions = model(input_eval)
+        predictions = tf.squeeze(predictions, 0)
+        predictions = predictions / temperature
+        predicted_id = tf.random.categorical(predictions, num_samples=num_samples)[-1,0].numpy()
+        input_eval = tf.expand_dims([predicted_id], 0)
+        text_generated.append(self.words['map_to'][predicted_id])
+      ret = start_string
+      for w in text_generated:
+        if w in punctuation:
+          ret += w
+        else:
+          ret += ' ' + w
+      if print_text: 
+        print(ret)
+        print()
+      return ret
+
+  def tune_LSTM(self,sequence_length=10, epochs=5, mname=None, embedding_dim=256, rnn_units=1024, bs=64, num_layers=1, lr=.001, epsilon=1e-08,
+                              normalize=0,dropout_rate=.2, regularize_rate=0):
+      def init_LSTMmodel(embedding_dim=256, num_layers=2,sequence_length=10, rnn_units=1024, bs=64,normalize=0,
+                   dropout_rate=.2, regularize_rate=.01):
+          inputs = tf.keras.Input(batch_input_shape=[bs, None])
+          x = Embedding(words['nunique'], embedding_dim, input_length=sequence_length,batch_input_shape=[bs, None])(inputs)
+          if normalize == 1:
+            x = tf.keras.layers.Normalization()(x)
+          for i in range(num_layers): 
+            x = LSTM(int(rnn_units/num_layers), return_sequences=True, stateful=True, recurrent_initializer='glorot_uniform')(x)
+            if dropout_rate > 0.0:
+              x = tf.keras.layers.Dropout(dropout_rate)(x)
+          if regularize_rate >0.0:
+            x = Dense(words['nunique'], activation='softmax', activity_regularizer=tf.keras.regularizers.L2(regularize_rate)) (x)
+          else:
+            x = Dense(words['nunique'], activation='softmax')(x)
+          model = tf.keras.Model(inputs,x)
+          return model
+
+      if self.training == None: self.dataset(sequence_length, bs, 0.1)
+      model = init_LSTMmodel(embedding_dim=embedding_dim, sequence_length=sequence_length, num_layers=num_layers, rnn_units=rnn_units, bs=bs,
+                         normalize=normalize, dropout_rate=dropout_rate,  regularize_rate=regularize_rate)
+
+      optimizer = tf.keras.optimizers.Adamax(learning_rate=lr,epsilon=epsilon,name='Adamax')
+      model.compile(optimizer=optimizer, loss='sparse_categorical_crossentropy')
+
+      if mname is None:
+        mname = model_name(sequence_length, epochs)
+      checkpoint_dir = models_dir / 'LSTM_training_checkpoints'
+      checkpoint_model_dir = checkpoint_dir / mname
+      checkpoint_prefix = checkpoint_model_dir / "ckpt_{epoch}"
+      checkpoint_callback=[tf.keras.callbacks.ModelCheckpoint(filepath=checkpoint_prefix, save_weights_only=True),tf.keras.callbacks.EarlyStopping(monitor='val_loss',patience=1,restore_best_weights=False)]
+
+      model.fit(self.training, validation_data=self.validation, epochs=epochs, callbacks=checkpoint_callback)
+      model.weights
+
+      model = init_LSTMmodel(embedding_dim=embedding_dim, sequence_length=sequence_length, num_layers=num_layers, rnn_units=rnn_units, bs=1, 
+                         normalize=normalize, dropout_rate=dropout_rate,  regularize_rate=regularize_rate)
+      
+      model.load_weights(tf.train.latest_checkpoint(checkpoint_model_dir)).expect_partial()
+      model.build(tf.TensorShape([1, None]))
+      model_names[model] = mname
+      shutil.rmtree(checkpoint_dir)
+      self.tuned_LSTM = model
+
+  def tune_GRU(self,sequence_length=10, epochs=5, mname=None, embedding_dim=256, rnn_units=1024, bs=64, num_layers=1, lr=.001, epsilon=1e-08,
+                              normalize=0,dropout_rate=.2, regularize_rate=0):
+      def init_GRUmodel(embedding_dim=256, num_layers=2,sequence_length=10, rnn_units=1024, bs=64,normalize=0,
+                   dropout_rate=.2, regularize_rate=.01):
+          inputs = tf.keras.Input(batch_input_shape=[bs, None])
+          x = Embedding(words['nunique'], embedding_dim, input_length=sequence_length,batch_input_shape=[bs, None])(inputs)
+          if normalize == 1:
+            x = tf.keras.layers.Normalization()(x)
+          for i in range(num_layers): 
+            x = GRU(rnn_units, return_sequences=True,stateful=True,recurrent_initializer='glorot_uniform')(x)
+            if dropout_rate > 0.0:
+              x = tf.keras.layers.Dropout(dropout_rate)(x)
+          if regularize_rate >0.0:
+            x = Dense(words['nunique'], activation='softmax', activity_regularizer=tf.keras.regularizers.L2(regularize_rate)) (x)
+          else:
+            x = Dense(words['nunique'], activation='softmax')(x)
+          model = tf.keras.Model(inputs,x)
+          return model
+
+      if self.training == None: self.dataset(sequence_length, bs, 0.1)
+      model = init_GRUmodel(embedding_dim=embedding_dim, sequence_length=sequence_length, num_layers=num_layers, rnn_units=rnn_units, bs=bs,
+                         normalize=normalize, dropout_rate=dropout_rate,  regularize_rate=regularize_rate)
+
+      optimizer = tf.keras.optimizers.Adamax(learning_rate=lr,epsilon=epsilon,name='Adamax')
+      model.compile(optimizer=optimizer, loss='sparse_categorical_crossentropy')
+
+      if mname is None:
+        mname = model_name(sequence_length, epochs)
+      checkpoint_dir = models_dir / 'GRU_training_checkpoints'
+      checkpoint_model_dir = checkpoint_dir / mname
+      checkpoint_prefix = checkpoint_model_dir / "ckpt_{epoch}"
+      checkpoint_callback=[tf.keras.callbacks.ModelCheckpoint(filepath=checkpoint_prefix, save_weights_only=True),tf.keras.callbacks.EarlyStopping(monitor='val_loss',patience=1,restore_best_weights=False)]
+
+      model.fit(self.training, validation_data=self.validation,epochs=epochs, callbacks=checkpoint_callback)
+
+      model = init_GRUmodel(embedding_dim=embedding_dim, sequence_length=sequence_length, num_layers=num_layers, rnn_units=rnn_units, bs=1, 
+                         normalize=normalize, dropout_rate=dropout_rate,  regularize_rate=regularize_rate)
+      
+      model.load_weights(tf.train.latest_checkpoint(checkpoint_model_dir)).expect_partial()
+      model.build(tf.TensorShape([1, None]))
+      model_names[model] = mname
+      shutil.rmtree(checkpoint_dir)
+      self.tuned_GRU = model
+
+  def tune_final_best_model(self, epochs=60, mname=None, bs=150, sequence_length = 10, config = False):
+      self.dataset(sequence_length, bs, 0.1)
+      def init_final_best_model(hp,bs=bs,sequence_length=sequence_length):
+          embedding_dim = hp.Choice('embedding_dim', [128, 256, 512, 1024])
+          num_layers = hp.Choice('num_layers', [0, 1, 2, 3, 4, 5])
+          rnn_units = hp.Choice('rnn_units', [10,32,64,128, 256, 512, 1024])
+          L2 = hp.Choice('L2', [0.0, 0.01, 0.02, 0.05])
+          DROP = hp.Choice('drop_percentage', [0.0, 0.08, .1, .2, .5])
+          epsilon = hp.Choice('epsilon', [1e-08,1e-07,1e-06,1e-05])
+          beta_2 = hp.Choice('beta_2', [0.999,0.95,0.9])
+          beta_1 = hp.Choice('beta_1', [0.9,0.99,0.8])
+          lr = hp.Choice('lr', [0.001,0.1,0.01,0.005])
+          normaliztion = hp.Choice("normalize", [1,0])
+          neuron_type = hp.Choice('GRU_place1', [1, 0])
+          neuron_type2 = hp.Choice('GRU_place2', [1, 0])
+          two_per_layer = hp.Choice('two_per_layer', [1,  0])
+          optimizer = hp.Choice('optimizer', [1,0])
+          
+          if optimizer == 1:
+            optimizer = tf.keras.optimizers.Adamax(learning_rate=lr,beta_1=beta_1,beta_2=beta_2,epsilon=epsilon,name='Adamax')
+          else:
+            optimizer = tf.keras.optimizers.Adam(learning_rate=lr,beta_1=beta_1,beta_2=beta_2,epsilon=epsilon, name='Adam')
+
+          inputs = tf.keras.Input(batch_input_shape=[bs, None])
+          x = Embedding(words['nunique'], embedding_dim, input_length=sequence_length,batch_input_shape=[bs, None])(inputs)
+          if normaliztion == 1: x = tf.keras.layers.Normalization()(x)
+          for _ in range(num_layers): 
+            if neuron_type == 1: x = GRU(rnn_units, return_sequences=True,stateful=True,recurrent_initializer='orthogonal',activity_regularizer=tf.keras.regularizers.L2(L2))(x)
+            else: x = LSTM(rnn_units, return_sequences=True, stateful=True, recurrent_initializer='orthogonal',activity_regularizer=tf.keras.regularizers.L2(L2))(x)
+            if two_per_layer == 1: 
+                if neuron_type == 1: x = GRU(rnn_units, return_sequences=True,stateful=True,recurrent_initializer='orthogonal',activity_regularizer=tf.keras.regularizers.L2(L2))(x)
+                else: x = LSTM(rnn_units, return_sequences=True, stateful=True, recurrent_initializer='orthogonal',activity_regularizer=tf.keras.regularizers.L2(L2))(x)
+
+            x = tf.keras.layers.Dropout(DROP)(x)
+          x = Dense(words['nunique'], activation='softmax', activity_regularizer=tf.keras.regularizers.L2(L2))(x)
+
+          model = tf.keras.Model(inputs,x)
+          model.compile(optimizer=optimizer, loss='sparse_categorical_crossentropy')
+          collect()
+          return model
+    
+      #if self.training == None: self.dataset(sequence_length, bs, 0.1)
+      #model = init_final_best_model()
+      
+      if mname is None:
+        mname = model_name(sequence_length, epochs)
+      
+      if config: checkpoint_callback=[tf.keras.callbacks.EarlyStopping(monitor='val_loss',patience=0,restore_best_weights=True)]
+      # else: 
+      #   checkpoint_dir = models_dir / 'hypertuned_training_checkpoints'
+      #   checkpoint_model_dir = checkpoint_dir / mname
+      #   checkpoint_prefix = checkpoint_model_dir / "ckpt_{epoch}"
+      #   checkpoint_callback=[tf.keras.callbacks.ModelCheckpoint(filepath=checkpoint_prefix, save_weights_only=True),tf.keras.callbacks.EarlyStopping(monitor='val_loss',patience=1,restore_best_weights=False)]
+      #   model = init_final_best_model()
+      #   model.fit(self.training, validation_data=self.validation,epochs=epochs, callbacks=checkpoint_callback)
+      #   model = init_final_best_model(bs=1)
+      #   model.load_weights(tf.train.latest_checkpoint(checkpoint_model_dir)).expect_partial()
+      #   model.build(tf.TensorShape([1, None]))
+      #   model_names[model] = mname
+      #   shutil.rmtree(checkpoint_dir)
+      #   self.attention_model = model
+
+      if config:
+        tuner = kt.RandomSearch(init_final_best_model,objective='val_loss',max_trials=400)
+        tuner.search(self.training, validation_data=self.validation,epochs=epochs, callbacks=checkpoint_callback)
+        #model = tuner.get_best_models()[0]
+        #self.best_hyperperameters = tuner.get_best_hyperparameters()[0]
+        self.tuner = tuner
+        #best_model = second_iteration.tuner.get_best_models(num_models=1)[0]
+            
+  def GAN_failure(self):
+    ''' 
+    Progress on this model was halted mid-way when it became apparant that the GAN loss between generator and discriminator are non-differentiable if taken as a sample of most probable words, like we have been doing. 
+    Another GAN model using transformers way replace this if time permits. 
+  '''
+    def create_text_generator_GAN_LSTM(sequence_length=10, num_training_epochs=5, mname=None, lr_gen=0.005, lr_des=0.005, bs=64, temperature=1):
+      def GAN_loss(labels, logits):
+        return tf.keras.losses.sparse_categorical_crossentropy(labels, logits, from_logits=True)
+      def GAN_des_loss(labels, logits):
+        return tf.keras.losses.BinaryCrossentropy(from_logits=True)
+      def init_GAN_LSTMmodel(embedding_dim=256, rnn_units=1024, bs=64):
+        inputs = tf.keras.Input(batch_input_shape=[bs, None])
+        x = Embedding(words['nunique'], embedding_dim, input_length=10,batch_input_shape=[bs, None])(inputs)
+        x = LSTM(int(rnn_units/2), return_sequences=True, stateful=True, recurrent_initializer='glorot_uniform')(x)
+        x = LSTM(int(rnn_units/2), return_sequences=True, stateful=True, recurrent_initializer='glorot_uniform')(x)
+        x = Dense(words['nunique'], activation='softmax')(x)
+        return tf.keras.Model(inputs,x)
+      def init_GAN_des(embedding_dim=256, rnn_units=1024, bs=64):
+        layers = [
+            Embedding(words['nunique'], embedding_dim, input_length=10,batch_input_shape=[bs, None]),
+            LSTM(int(rnn_units/2), return_sequences=True, stateful=True, recurrent_initializer='glorot_uniform'),
+            LSTM(int(rnn_units/2), return_sequences=True, stateful=True, recurrent_initializer='glorot_uniform'),
+            Dense(1, activation='sigmoid')]
+        return Sequential(layers)
+      from itertools import islice
+      dataset = tf.data.Dataset.from_tensor_slices(words['as_int']).batch(sequence_length+1, drop_remainder=True).map(split_input_target)
+      x = tf.data.Dataset.from_tensor_slices([x for (x,_) in dataset]).batch(bs, drop_remainder=True)
+      y = tf.data.Dataset.from_tensor_slices([y for (_,y) in dataset]).batch(bs, drop_remainder=True)
+      dataset = tf.data.Dataset.zip((x,y))
+
+      discriminator = init_GAN_des(bs=bs)
+      #discriminator.build(tf.TensorShape([bs, None]))
+      model = init_GAN_LSTMmodel(bs=bs)
+      discriminator.compile(optimizer='adam', loss=tf.keras.losses.BinaryCrossentropy(from_logits=False))
+      #model.compile(optimizer='adam', loss=loss)  # , jit_compile=True
+
+      if mname is None:
+        mname = model_name(sequence_length, num_training_epochs)
+      checkpoint_dir = models_dir / 'GAN_LSTM_training_checkpoints'
+      checkpoint_model_dir = checkpoint_dir / mname
+      checkpoint_prefix = checkpoint_model_dir / "ckpt_{epoch}"
+      checkpoint_callback=tf.keras.callbacks.ModelCheckpoint(filepath=checkpoint_prefix, save_weights_only=True)
+
+      #model.fit(dataset, epochs=1, callbacks=[checkpoint_callback])
+      
+      dataset = tf.data.Dataset.from_tensor_slices(words['as_int']).batch(sequence_length+1, drop_remainder=True).map(split_input_target)#.shuffle(100000)
+      x = tf.data.Dataset.from_tensor_slices([x for (x,_) in dataset])
+      y = tf.data.Dataset.from_tensor_slices([y for (_,y) in dataset])
+      dataset = tf.data.Dataset.zip((x,y))
+      no = np.array([0]*64).reshape([bs,1])
+      yes = np.array([1]*64).reshape([bs,1])
+      #model.compile(optimizer='adam', loss=GAN_loss)
+      
+      def fix_shape(inputs):
+          fake = np.array([[tf.random.categorical(fake / temperature, num_samples=1)[-1,0].numpy()] for fake in inputs])
+          return tf.concat([np.delete(xx,[0],1),fake.reshape([bs,1])],1)
+
+      @tf.function()#input_signature=[tf.TensorSpec(None, tf.int64)]
+      def tf_function(input):
+        y = tf.numpy_function(fix_shape, list(input), tf.int64)
+        return y
+
+      # https://machinelearningmastery.com/how-to-code-the-generative-adversarial-network-training-algorithm-and-loss-functions/
+      def gan(generator, discriminator):
+        discriminator.trainable = False
+        generator.trainable = True
+        model = Sequential()
+        model.add(generator)
+        #model.add(tf.keras.layers.Lambda(tf_function, name="tf_function"))
+        model.add(discriminator)
+        model.compile(loss='binary_crossentropy', optimizer='adam')
+        #discriminator.trainable = True
+        return model
+      gan=gan(model, discriminator)
+
+      i = 0
+      while True:
+        discriminator.reset_states()
+        model.reset_states()
+        
+        try:
+          xx = np.array(list(islice(x, int(bs*i), int(bs*(i+1)))))
+          yy = np.array(list(islice(y, int(bs*i), int(bs*(i+1)))))
+        except: break
+        i+=1
+        fake = model.predict_on_batch(xx)
+        fake = np.array([[tf.random.categorical(fake / temperature, num_samples=1)[-1,0].numpy()] for fake in fake])
+        fake = tf.concat([np.delete(xx,[0],1),fake.reshape([bs,1])],1)
+        discriminator.train_on_batch(x=fake, y = no)
+        discriminator.train_on_batch(x=yy, y = yes)
+
+        result = discriminator.predict_on_batch(fake)
+        #result = np.array([result[-1] for result in result])
+        #print(result.shape,result)
+        print(result.shape)
+        print(xx.shape)
+        print(fake.shape)
+        
+        gan.train_on_batch(x=xx, y=yes)
+        #model.train_on_batch(x=xx, y=result)
+        break
+      
+
+      model = init_GAN_LSTMmodel(bs=1)
+      model.load_weights(tf.train.latest_checkpoint(checkpoint_model_dir)).expect_partial()
+      model.build(tf.TensorShape([1, None]))
+      model_names[model] = mname
+      shutil.rmtree(checkpoint_dir)
+
+      return model
+    model3 = create_text_generator_GAN_LSTM(num_training_epochs=20)
+    print(generate_text(model3, "Antifa calls for", temperature = 1))
+  ##########################################################################################
+  # John's evaluative functions
+  ##########################################################################################
+  def split_train_test(self):
+        sents = list(self.corpus.sents())
+        shuffle(sents)
+        cutoff = int(0.8*len(sents))
+        training_set = sents[:cutoff]
+        test_set = [[word.lower() for word in sent] for sent in sents[cutoff:]]
+        return training_set, test_set
+  def calculate_smoothing(self,sentences, bigram, smoothing_function, parameter):
+        total_log_prob = 0
+        test_token_count = 0
+        for sentence in sentences:
+            test_token_count += len(sentence) + 1 # have to consider the end token
+            total_log_prob += smoothing_function(sentence, bigram, parameter)
+        return math.exp(-total_log_prob / test_token_count)
+  def smoothing(self):
+    class Trigram():
+      # Imported from lab 6 (John Rutledge's)
+      def __init__(self):
+          self.trigram_counts = defaultdict(Counter)
+          self.bigram_counts = defaultdict(Counter)
+          self.unigram_counts = Counter()
+          self.context = defaultdict(Counter)
+          self.tri_context = defaultdict(Counter)
+          self.start_count = 0
+          self.token_count = 0
+          self.vocab_count = 0
+      
+      def convert_sentence(self, sentence):
+          return ["<s>"] + [w.lower() for w in sentence] + ["</s>"]
+      
+      def get_counts(self, sentences):
+          # collect unigram counts
+          for sentence in sentences:
+              sentence = self.convert_sentence(sentence)
+              for word in sentence[1:]:  # from 1, because we don't need the <s> token
+                  self.unigram_counts[word] += 1
+              self.start_count += 1
+              
+          # collect bigram counts
+          for sentence in sentences:
+              sentence = self.convert_sentence(sentence)
+              bigram_list = zip(sentence[:-1], sentence[1:])
+              for bigram in bigram_list:
+                  self.bigram_counts[bigram[0]][bigram[1]] += 1
+                  self.context[bigram[1]][bigram[0]] += 1
+
+          # collect trigram counts
+          for sentence in sentences:
+              sentence = self.convert_sentence(sentence)
+              trigram_list = zip(sentence[0:], sentence[1:], sentence[2:])
+              for w1,w2,w3 in trigram_list:
+                  self.trigram_counts[(w1,w2)][w3] += 1
+                  self.tri_context[w3][(w1,w2)] += 1
+                  
+          self.token_count = sum(self.unigram_counts.values())
+          self.vocab_count = len(self.unigram_counts.keys())
+    
+
+    self.trigram = Trigram()
+    self.trigram.get_counts(sent_tokenize(self.corpus))
+  def Interpolate_Trigram(self, test_set):
+      """Input text"""
+      self.smoothing()
+      test_set = nltk.Text(test_set)
+      def interpolation(sentence, trigram, lambdas):
+        bigram_lambda = lambdas[0]
+        unigram_lambda = lambdas[1]
+        trigram_lambda = lambdas[2]
+        zerogram_lambda = 1 - unigram_lambda - bigram_lambda - trigram_lambda
+        
+        sentence = trigram.convert_sentence(sentence)
+        bigram_list = zip(sentence[:-1], sentence[1:])
+        trigram_list = list(zip(*[sentence[x:] for x in range(0, 3)]))
+        prob = 0
+        for w1, prev_word, word in trigram_list:
+            # bigram probability
+            sm_trigram_counts = trigram.trigram_counts[(w1,prev_word)][word]
+            sm_bigram_counts = trigram.bigram_counts[prev_word][word]
+            if sm_bigram_counts == 0: interp_bigram_counts = 0
+            else:
+                if prev_word == "<s>": u_counts = trigram.start_count
+                else: u_counts = trigram.unigram_counts[w1]
+                interp_bigram_counts = sm_bigram_counts / (float(u_counts) * bigram_lambda + [1 if float(float(u_counts) * bigram_lambda)==0 else 0][0])
+                
+            if sm_trigram_counts == 0: interp_trigram_counts = 0
+            else:
+                if prev_word == "<s>": u_counts = trigram.start_count
+                else: u_counts = trigram.unigram_counts[w1]
+                interp_trigram_counts = sm_trigram_counts / (float(u_counts) * trigram_lambda + [1 if float(float(u_counts) * trigram_lambda)==0 else 0][0])
+
+            # unigram probability
+            interp_unigram_counts = (trigram.unigram_counts[word] / trigram.token_count) * unigram_lambda
+
+            # "zerogram" probability: this is to account for out-of-vocabulary words, this is just 1 / |V|
+            vocab_size = len(trigram.unigram_counts)
+            interp_zerogram_counts = (1 / float(vocab_size)) * zerogram_lambda
+        
+            prob += math.log(interp_trigram_counts + interp_bigram_counts + interp_unigram_counts + interp_zerogram_counts)
+        return prob
+
+      self.trigram.get_counts(self.corpus)
+      return self.calculate_smoothing(test_set, self.trigram, interpolation, (0.7, 0.19, .1))
+  def loss(self):
+    pass
+
+##########################################################################################
+# End of John's experiments
+##########################################################################################
 
 def list_models():
   if models_dir.is_dir():
@@ -318,3 +775,4 @@ chars['map_from'] = {c:i for i, c in enumerate(chars['unique'])}
 chars['map_to'] = np.array(chars['unique'])
 chars['as_int'] = np.array([chars['map_from'][c] for c in corpus_char_list])
 
+second_iteration = tuned_models(words,chars,corpus)
