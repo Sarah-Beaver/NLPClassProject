@@ -4,7 +4,6 @@ warnings.filterwarnings('ignore')
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
 import pickle
-import keras_tuner as kt
 
 import tensorflow as tf
 from tensorflow.keras.models import Sequential, load_model
@@ -33,6 +32,7 @@ nltk.download('punkt')
 try:
   #tf.config.experimental.set_memory_growth(tf.config.list_physical_devices('GPU')[0], True)
   tf.keras.mixed_precision.set_global_policy('mixed_float16')
+  import keras_tuner as kt
 except:
   pass
 
@@ -113,10 +113,6 @@ def create_corpus():
 
   return words_in_corpus, chars_in_corpus, corpus, df
 
-
-
-
-
 # for creating training examples
 def split_input_target(chunk):
   input_text = chunk[:-1]
@@ -128,7 +124,7 @@ def loss(labels, logits):
   return tf.keras.losses.sparse_categorical_crossentropy(labels, logits, from_logits=True)
 
 def model_name(sequence_length, num_training_epochs):
-  return f'seq{sequence_length}_ep{num_training_epochs}_{datetime.isoformat(datetime.now())}'
+    return f'seq{sequence_length}_ep{num_training_epochs}_{str(datetime.now().month)+"_"+str(datetime.now().day) +"_"+str(datetime.now().year) +"_"}'
 
 def prep_training_dataset(sequence_length=10, batch_size=64, buffer_size=10000):
   ''' 
@@ -310,10 +306,9 @@ class tuned_models:
       self.training, self.validation = None, None
       self.trigram = None
       self.corpus = corpus
-      self.attention_model = None
       self.tuner = None
-  def pickle_save(self):
-        return self.tuner
+      self.tuned_model = None
+      self.hyperperameter = pickle.load( open( "tuner.pkl", "rb"))
   def dataset(self, sequence_length=10, batch_size=64, split_testing = 0.1, buffer_size=10000, seed = 3):
       dataset, validation = train_test_split(words['as_int'], test_size=split_testing, random_state=seed)
       def split(input):
@@ -323,18 +318,24 @@ class tuned_models:
           return dataset_unshuffled.shuffle(buffer_size).batch(batch_size, drop_remainder=True)
       self.training, self.validation = split(dataset), split(validation)
 
-  def generate_text(self, model, start_string = "Antifa calls for", num_generate=50, temperature = 1.0, num_samples=1, print_text=False):
+  def generate_text(self, model, start_string = "Antifa calls for", num_generate=50, temperature = 1.0, num_samples=1, print_text=False, resetable=False):
       input_eval = [self.words['map_from'][w] for w in process_new_text(start_string)]
       input_eval = tf.expand_dims(input_eval, 0)
       text_generated = []
-      model.reset_states()
+      if resetable: model.reset_states()
       for i in range(num_generate):
         predictions = model(input_eval)
         predictions = tf.squeeze(predictions, 0)
         predictions = predictions / temperature
         predicted_id = tf.random.categorical(predictions, num_samples=num_samples)[-1,0].numpy()
-        input_eval = tf.expand_dims([predicted_id], 0)
         text_generated.append(self.words['map_to'][predicted_id])
+
+        input_eval = text_generated
+        if len(input_eval)>10:
+            input_eval = input_eval[-10:]
+        input_eval = [self.words['map_from'][w] for w in input_eval]
+        input_eval = tf.expand_dims(input_eval, 0)
+
       ret = start_string
       for w in text_generated:
         if w in punctuation:
@@ -435,39 +436,28 @@ class tuned_models:
       shutil.rmtree(checkpoint_dir)
       self.tuned_GRU = model
 
-  def tune_final_best_model(self, epochs=60, mname=None, bs=150, sequence_length = 10, config = False):
-      self.dataset(sequence_length, bs, 0.1)
-      def init_final_best_model(hp,bs=bs,sequence_length=sequence_length):
-          embedding_dim = hp.Choice('embedding_dim', [128, 256, 512, 1024])
-          num_layers = hp.Choice('num_layers', [0, 1, 2, 3, 4, 5])
-          rnn_units = hp.Choice('rnn_units', [10,32,64,128, 256, 512, 1024])
-          L2 = hp.Choice('L2', [0.0, 0.01, 0.02, 0.05])
-          DROP = hp.Choice('drop_percentage', [0.0, 0.08, .1, .2, .5])
-          epsilon = hp.Choice('epsilon', [1e-08,1e-07,1e-06,1e-05])
-          beta_2 = hp.Choice('beta_2', [0.999,0.95,0.9])
-          beta_1 = hp.Choice('beta_1', [0.9,0.99,0.8])
-          lr = hp.Choice('lr', [0.001,0.1,0.01,0.005])
+  def tune_final_best_model(self, epochs=60, mname=None, bs=200, sequence_length = 10, config = False,embedding_dim=500):
+      if config: self.dataset(sequence_length, bs, 0.4)
+      elif self.training == None: self.dataset(sequence_length, bs, 0.1)
+      import keras_tuner as kt
+      def init_final_best_model(hp,bs=bs,sequence_length=sequence_length,embedding_dim=embedding_dim):
+          num_layers = hp.Choice('num_layers', [1, 2])
+          rnn_units = hp.Choice('rnn_units', [512, 1024])
+          L2 = hp.Choice('L2', [0.005, 0.01, 0.03])
+          DROP = hp.Choice('drop_percentage', [0.0, .2])
+          epsilon = hp.Choice('epsilon', [1e-06])
+          beta_2 = hp.Choice('beta_2', [0.999])
+          beta_1 = hp.Choice('beta_1', [0.9])
+          lr = hp.Choice('lr', [0.05])
           normaliztion = hp.Choice("normalize", [1,0])
-          neuron_type = hp.Choice('GRU_place1', [1, 0])
-          neuron_type2 = hp.Choice('GRU_place2', [1, 0])
-          two_per_layer = hp.Choice('two_per_layer', [1,  0])
-          optimizer = hp.Choice('optimizer', [1,0])
           
-          if optimizer == 1:
-            optimizer = tf.keras.optimizers.Adamax(learning_rate=lr,beta_1=beta_1,beta_2=beta_2,epsilon=epsilon,name='Adamax')
-          else:
-            optimizer = tf.keras.optimizers.Adam(learning_rate=lr,beta_1=beta_1,beta_2=beta_2,epsilon=epsilon, name='Adam')
+          optimizer = tf.keras.optimizers.Adamax(learning_rate=lr,beta_1=beta_1,beta_2=beta_2,epsilon=epsilon,name='Adamax')
 
           inputs = tf.keras.Input(batch_input_shape=[bs, None])
           x = Embedding(words['nunique'], embedding_dim, input_length=sequence_length,batch_input_shape=[bs, None])(inputs)
           if normaliztion == 1: x = tf.keras.layers.Normalization()(x)
           for _ in range(num_layers): 
-            if neuron_type == 1: x = GRU(rnn_units, return_sequences=True,stateful=True,recurrent_initializer='orthogonal',activity_regularizer=tf.keras.regularizers.L2(L2))(x)
-            else: x = LSTM(rnn_units, return_sequences=True, stateful=True, recurrent_initializer='orthogonal',activity_regularizer=tf.keras.regularizers.L2(L2))(x)
-            if two_per_layer == 1: 
-                if neuron_type == 1: x = GRU(rnn_units, return_sequences=True,stateful=True,recurrent_initializer='orthogonal',activity_regularizer=tf.keras.regularizers.L2(L2))(x)
-                else: x = LSTM(rnn_units, return_sequences=True, stateful=True, recurrent_initializer='orthogonal',activity_regularizer=tf.keras.regularizers.L2(L2))(x)
-
+            x = GRU(rnn_units, return_sequences=True,stateful=True,recurrent_initializer='glorot_uniform',activity_regularizer=tf.keras.regularizers.L2(L2))(x)
             x = tf.keras.layers.Dropout(DROP)(x)
           x = Dense(words['nunique'], activation='softmax', activity_regularizer=tf.keras.regularizers.L2(L2))(x)
 
@@ -475,35 +465,36 @@ class tuned_models:
           model.compile(optimizer=optimizer, loss='sparse_categorical_crossentropy')
           collect()
           return model
-    
-      #if self.training == None: self.dataset(sequence_length, bs, 0.1)
-      #model = init_final_best_model()
       
       if mname is None:
         mname = model_name(sequence_length, epochs)
       
-      if config: checkpoint_callback=[tf.keras.callbacks.EarlyStopping(monitor='val_loss',patience=0,restore_best_weights=True)]
-      # else: 
-      #   checkpoint_dir = models_dir / 'hypertuned_training_checkpoints'
-      #   checkpoint_model_dir = checkpoint_dir / mname
-      #   checkpoint_prefix = checkpoint_model_dir / "ckpt_{epoch}"
-      #   checkpoint_callback=[tf.keras.callbacks.ModelCheckpoint(filepath=checkpoint_prefix, save_weights_only=True),tf.keras.callbacks.EarlyStopping(monitor='val_loss',patience=1,restore_best_weights=False)]
-      #   model = init_final_best_model()
-      #   model.fit(self.training, validation_data=self.validation,epochs=epochs, callbacks=checkpoint_callback)
-      #   model = init_final_best_model(bs=1)
-      #   model.load_weights(tf.train.latest_checkpoint(checkpoint_model_dir)).expect_partial()
-      #   model.build(tf.TensorShape([1, None]))
-      #   model_names[model] = mname
-      #   shutil.rmtree(checkpoint_dir)
-      #   self.attention_model = model
+      if config: 
+        checkpoint_callback=[tf.keras.callbacks.EarlyStopping(monitor='val_loss',patience=1,restore_best_weights=True)]
+      else: 
+        checkpoint_dir = models_dir / 'hypertuned_training_checkpoints'
+        checkpoint_model_dir = checkpoint_dir / mname
+        checkpoint_prefix = checkpoint_model_dir / "ckpt_{epoch}"
+        checkpoint_callback=[tf.keras.callbacks.ModelCheckpoint(filepath=checkpoint_prefix, save_weights_only=True),tf.keras.callbacks.EarlyStopping(monitor='val_loss',patience=3,restore_best_weights=True)]
+        model = init_final_best_model(self.hyperperameter,bs=bs)
+        model.summary()
+        model.fit(self.training, validation_data=self.validation,epochs=epochs, callbacks=checkpoint_callback)
+        model = init_final_best_model(self.hyperperameter,bs=1)
+        model.load_weights(tf.train.latest_checkpoint(checkpoint_model_dir)).expect_partial()
+        model.build(tf.TensorShape([1, None]))
+        model_names[model] = mname
+        shutil.rmtree(checkpoint_dir)
+        self.tuned_model = model
+        #save(model)
 
       if config:
-        tuner = kt.RandomSearch(init_final_best_model,objective='val_loss',max_trials=400)
+        tuner = kt.Hyperband(init_final_best_model,objective='val_loss',max_epochs=100,hyperband_iterations=5)
         tuner.search(self.training, validation_data=self.validation,epochs=epochs, callbacks=checkpoint_callback)
-        #model = tuner.get_best_models()[0]
-        #self.best_hyperperameters = tuner.get_best_hyperparameters()[0]
         self.tuner = tuner
-        #best_model = second_iteration.tuner.get_best_models(num_models=1)[0]
+        self.hyperperameter = tuner.get_best_hyperparameters()[0]
+        pickle.dump(self.hyperperameter,open( "tuner.pkl", "wb" ))
+        pickle.dump(self.hyperperameter,open( "tuner_save.pkl", "wb" ))
+        self.tune_final_best_model(config=False)
             
   def GAN_failure(self):
     ''' 
